@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "AIComposer — a tool for generating verified implementations from documentation and CVL specifications"
 readme = "README.md"
 requires-python = ">=3.12"
-license = {text = "MIT"}
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [
     {name = "Certora Ltd."}
 ]
