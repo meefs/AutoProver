@@ -9,8 +9,6 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import cast, AsyncIterator, Protocol, Callable, Awaitable
 
-from graphcore.tools.memory import async_memory_tool
-
 from composer.diagnostics.logging_setup import setup_autoprove_logging
 from composer.diagnostics.timing import RunSummary, install_run_summary
 from composer.input.types import DEFAULT_RECURSION_LIMIT, ExtendedModelOptions, RAGDBOptions
@@ -25,6 +23,7 @@ from composer.spec.system_model import SolidityIdentifier
 from composer.spec.context import (
     WorkflowContext,
 )
+from composer.llm.registry import get_provider_for
 from composer.spec.source.pipeline import run_autoprove_pipeline, AutoProveResult
 from composer.spec.source.artifacts import ProverSourceCode, ProverArtifactStore
 from composer.spec.source.design_doc_finder import resolve_design_doc, discovery_cache_key
@@ -134,7 +133,8 @@ async def autoprove_executor(args: AutoProveArgs, summary: RunSummary) -> AsyncI
     relative_path = str(full_contract_path.relative_to(project_root))
 
     # Set up services
-    model_factory = llm_factory(args)
+    tiered = get_provider_for(tiered=args)
+        
     model = get_model()
 
     thread_id = f"autoprove_{uuid.uuid4().hex[:12]}"
@@ -145,7 +145,7 @@ async def autoprove_executor(args: AutoProveArgs, summary: RunSummary) -> AsyncI
 
     async with (
         standard_connections(
-            embedder=DefaultEmbedder(model)
+            provider=tiered.provider_kind, embedder=DefaultEmbedder(model)
         ) as conns,
         PostgreSQLRAGDatabase.rag_context(model, args.rag_db) as rag_db,
         async_tool_context(),
@@ -164,9 +164,8 @@ async def autoprove_executor(args: AutoProveArgs, summary: RunSummary) -> AsyncI
         # scope, which only ``run_task`` (reachable once ``runner`` has the handler
         # factory) installs.
         models = ModelProvider(
-            factory=model_factory,
-            heavy_model=args.heavy_model,
-            lite_model=args.lite_model,
+            heavy_model=tiered.heavy,
+            lite_model=tiered.lite,
             checkpointer=conns.checkpointer,
         )
 
@@ -183,7 +182,7 @@ async def autoprove_executor(args: AutoProveArgs, summary: RunSummary) -> AsyncI
             if args.cache_ns is not None else None
         )
         disc_ctx = WorkflowContext.create(
-            services=lambda namespace: async_memory_tool(conns.memory(namespace)),
+            services=conns.memory,
             thread_id=thread_id,
             store=conns.store,
             recursion_limit=args.recursion_limit,
@@ -248,7 +247,7 @@ async def autoprove_executor(args: AutoProveArgs, summary: RunSummary) -> AsyncI
             )
 
             ctx = WorkflowContext.create(
-                services=lambda namespace: async_memory_tool(conns.memory(namespace)),
+                services=conns.memory,
                 thread_id=thread_id,
                 store=conns.store,
                 recursion_limit=args.recursion_limit,
