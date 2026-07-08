@@ -392,7 +392,7 @@ async def _run_codegen(
                 flow_input["working_spec"] = snapshot["working_spec"]
 
     try:
-        import grandalf
+        import grandalf #type: ignore
         layout = workflow_exec.get_graph().draw_ascii()
         logger.debug(f"\n{layout}")
     except ModuleNotFoundError:

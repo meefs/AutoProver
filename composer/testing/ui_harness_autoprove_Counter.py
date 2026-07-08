@@ -25,7 +25,7 @@ post-bug-analysis *refinement conversation* is a different mechanism: it
 runs through a ``RichConsoleConversationClient`` outside the Textual
 screen and consumes plain-text human input from stdin. **Run the pipeline
 with ``--interactive``** to exercise it — the refinement conversation's four
-tape entries live in the ``bug-0-Increment`` lane, after the property-extraction
+tape entries live in the ``extract-0`` lane, after the property-extraction
 entries. Routing is per-lane now, so skipping ``--interactive`` just leaves
 those entries unconsumed rather than corrupting another phase. Every
 expected human reply is embedded as a ``[TAPE EXPECTATION: respond ...]``
@@ -48,19 +48,19 @@ so their responses live in the parent's lane.
                       so it has no lane
     ── after harness creation, these lanes run concurrently ──
     invariants       : get_invariant_formulation (+ invariant_feedback ×3)
-    bug-0-Increment  : run_property_inference (+ refinement when --interactive)
+    extract-0        : run_property_inference (+ refinement when --interactive)
     ── staged CVL join, after the concurrent branch completes ──
     invariant-cvl    : batch_cvl_generation, component=None
                         (+ cvl_research, code_explorer, feedback ×2, CEX ×1)
-    cvl-0-Increment  : batch_cvl_generation, component=<one>
+    formalize-0      : batch_cvl_generation, component=<one>
                         (+ feedback ×1, CEX ×1 — surfaces the real
                         ``incrementOther`` implementation bug)
     ── final, best-effort report phase ──
     report           : build_report → call_grouping_llm (one structured-output
                         call partitioning the formalized properties into groups)
 
-    Per-component lanes are ``{bug,cvl}-{component index}-{slugified_name}``;
-    here the Counter's sole component is "Increment".
+    Per-component lanes are ``extract-{component index}`` / ``formalize-{component
+    index}`` (from ``pipeline.core``); the Counter has a single component, index 0.
 """
 
 from typing import Any
@@ -70,8 +70,9 @@ from composer.testing.harness_tape import HarnessFakeLLM, install_fake_llm
 from composer.spec.source.task_ids import (
     DESIGN_DOC_DISCOVERY_TASK_ID,
     SYSTEM_ANALYSIS_TASK_ID, HARNESS_TASK_ID, INVARIANTS_TASK_ID,
-    INVARIANT_CVL_TASK_ID, REPORT_TASK_ID, bug_analysis_task_id, cvl_gen_task_id,
+    INVARIANT_CVL_TASK_ID, REPORT_TASK_ID,
 )
+from composer.pipeline.core import extract_task_id, formalize_task_id
 
 from langchain_core.messages import AIMessage, BaseMessage
 from langchain_core.messages.tool import ToolCall
@@ -1417,8 +1418,8 @@ _AUTOPROVE_TAPE: dict[str, list[BaseMessage]] = {
     HARNESS_TASK_ID: _HARNESS_TAPE,
     INVARIANTS_TASK_ID: _INVARIANTS_TAPE,
     INVARIANT_CVL_TASK_ID: _INVARIANT_CVL_TAPE,
-    bug_analysis_task_id(0, "Increment"): _BUG_TAPE,
-    cvl_gen_task_id(0, "Increment"): _CVL_TAPE,
+    extract_task_id(0): _BUG_TAPE,
+    formalize_task_id(0): _CVL_TAPE,
     REPORT_TASK_ID: _REPORT_TAPE,
 }
 
@@ -1428,7 +1429,7 @@ _AUTOPROVE_TAPE: dict[str, list[BaseMessage]] = {
 # ---------------------------------------------------------------------------
 #
 # The CEX analyzer's response is inlined at its position within the
-# invariant-cvl / cvl-0-Increment lane (see the ``CEX.1`` entry after Q13's verify_spec).
+# invariant-cvl / formalize-0 lane (see the ``CEX.1`` entry after Q13's verify_spec).
 # There is no side-channel tape — each call is routed to its phase's lane by
 # ``run_task`` task_id, and within a lane responses are consumed in order.
 

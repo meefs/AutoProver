@@ -16,37 +16,22 @@ from the non-source spec modules).
 """
 
 import argparse
-import hashlib
-import pathlib
-import sys
 import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, AsyncIterator, Awaitable, Callable, Protocol, cast
 
-from composer.core.user import user_data_ns
-from composer.diagnostics.logging_setup import setup_autoprove_logging
-from composer.diagnostics.timing import RunSummary, install_run_summary
+from composer.diagnostics.timing import RunSummary
 from composer.input.parsing import Arg, add_protocol_args
-from composer.input.types import DEFAULT_RECURSION_LIMIT, ExtendedModelOptions, RAGDBOptions
+from composer.input.types import DEFAULT_RECURSION_LIMIT, RAGDBOptions, ExtendedModelOptions
 from composer.io.multi_job import HandlerFactory
-from composer.io.thread_logging import thread_logger, default_logging_ns
-from composer.kb.knowledge_base import DefaultEmbedder
 from composer.rag.db import FOUNDRY_DEFAULT_CONNECTION, PostgreSQLRAGDatabase
-from composer.rag.models import get_model
-from composer.spec.context import WorkflowContext
-from composer.spec.system_model import SolidityIdentifier
-from composer.spec.service_host import ModelProvider
 from composer.spec.util import FS_FORBIDDEN_READ
-from composer.ui.tool_display import async_tool_context
-from composer.workflow.services import standard_connections, llm_factory
-from composer.llm.registry import get_provider_for
 
-from composer.foundry.artifacts import FoundrySourceCode
 from composer.foundry.env import build_foundry_env
 from composer.foundry.pipeline import (
-    FoundryPhase, FoundryPipelineResult, run_foundry_pipeline,
+    FoundryPhase, FoundryPipelineResult, backend
 )
-from composer.spec.source.design_doc_finder import resolve_design_doc, discovery_cache_key
+from composer.pipeline.cli import cli_pipeline, user_ns
 
 
 # ---------------------------------------------------------------------------
@@ -79,26 +64,9 @@ class FoundryArgs(ExtendedModelOptions, FoundryRAGDBOptions, Protocol):
     forge_timeout_s: int
     max_forge_runners: int
 
-
-def _user_ns(*parts: str | tuple[str, ...]) -> tuple[str, ...]:
-    out: list[str] = []
-    for p in parts:
-        if isinstance(p, str):
-            out.append(p)
-        else:
-            out.extend(p)
-    return user_data_ns() + tuple(out)
-
-
-def _root_cache_key(
-    project_root: str,
-    system_doc_path: pathlib.Path,
-    relative_path: str,
-    contract_name: str,
-) -> str:
-    doc_hash = hashlib.sha256(system_doc_path.read_bytes()).hexdigest()
-    combined = "|".join([project_root, doc_hash, relative_path, contract_name])
-    return hashlib.sha256(combined.encode()).hexdigest()[:16]
+    @property
+    def threat_model(self) -> None:
+         ...
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +100,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-bug-rounds", type=int, default=3, help="Max bug-extraction rounds per component (default: 3)")
     parser.add_argument("--forge-binary", default="forge", help="`forge` executable on PATH (default: forge)")
     parser.add_argument("--forge-timeout-s", type=int, default=600, help="Per-`forge test` invocation timeout in seconds (default: 600)")
+    parser.set_defaults(threat_model=None)
     return parser
 
 
@@ -140,145 +109,39 @@ async def _entry_point(summary: RunSummary) -> AsyncIterator[FoundryRunner]:
     parser = _build_parser()
     args = cast(FoundryArgs, parser.parse_args())
 
-    project_root = pathlib.Path(args.project_root).resolve()
-    if not (project_root / "foundry.toml").is_file():
-        parser.error(f"{project_root}/foundry.toml not found — not a foundry project")
-    main_path, contract_name = args.main_contract.split(":", 1)
-    contract_name = SolidityIdentifier(contract_name)
-    full_path = pathlib.Path(main_path).resolve()
-    if not full_path.is_relative_to(project_root):
-        parser.error(f"Invalid path: {full_path} doesn't appear in project root {project_root}")
-    relative_path = str(full_path.relative_to(project_root))
-
-    model = get_model()
-    tiered = get_provider_for(tiered=args)
-
-    # Discovery cache namespace is DOC-INDEPENDENT (the doc is discovery's output, not
-    # an input); the per-doc root cache key is derived after the doc is resolved, inside
-    # ``runner``.
-    disc_cache_ns: tuple[str, ...] | None = (
-        _user_ns(args.cache_ns, "discovery",
-                 discovery_cache_key(str(project_root), relative_path, contract_name))
-        if args.cache_ns is not None else None
-    )
-
     thread_id = f"foundry_{uuid.uuid4().hex[:12]}"
-    text_log, events_log = setup_autoprove_logging(project_root, thread_id)
-    print(f"foundry logs: {text_log}\n         events: {events_log}", file=sys.stderr)
-    install_run_summary(summary)
 
-    model_fact = llm_factory(args)
 
-    async with (
-        standard_connections(provider=tiered.provider_kind, embedder=DefaultEmbedder(model)) as conns,
-        PostgreSQLRAGDatabase.rag_context(model, args.rag_db) as foundry_rag_db,
-        async_tool_context(),
-        thread_logger(
-            conns.store,
-            {
-                "root_thread_id": thread_id,
-                "workflow": "foundry",
-                # Effective memory namespace + the doc-INDEPENDENT discovery cache root,
-                # so run-trail tooling can find this run's entries without reverse-
-                # engineering namespaces from thread ids. The per-doc *root* cache is
-                # only known after discovery, so it is recorded from inside ``runner``
-                # via the run-data logger under "cache_root".
-                "discovery_cache_root": list(disc_cache_ns) if disc_cache_ns is not None else None,
-                "memory_ns": args.memory_ns if args.memory_ns is not None else thread_id,
-            },
-            default_logging_ns(uid=None),
-            run_id=summary.run_id,
-        ) as data_logger,
-    ):
-        model_provider = ModelProvider(
-            checkpointer=conns.checkpointer,
-            heavy_model=tiered.heavy,
-            lite_model=tiered.lite
-        )
-
-        memory_ns = args.memory_ns
-        disc_ctx = WorkflowContext.create(
-            services=lambda ns: conns.memory(ns),
-            thread_id=thread_id,
-            store=conns.store,
-            recursion_limit=args.recursion_limit,
-            cache_namespace=disc_cache_ns,
-            memory_namespace=memory_ns,
-        )
-
-        async def runner(
-            handler: HandlerFactory[FoundryPhase, None],
-        ) -> FoundryPipelineResult:
-            # Resolve the design doc first (supplied path, or auto-discovery under the
-            # ``DISCOVER_DESIGN_DOC`` phase). The per-doc cache key, env, ctx, and source
-            # artifact are all keyed off the resolved doc and built here.
-            doc_path, content = await resolve_design_doc(
-                system_doc_arg=args.system_doc,
-                project_root=str(project_root),
-                contract_name=contract_name,
-                relative_path=relative_path,
-                forbidden_read=FS_FORBIDDEN_READ,
-                uploader=conns.uploader,
-                models=model_provider,
-                handler=handler,
-                discover_phase=FoundryPhase.DISCOVER_DESIGN_DOC,
-                disc_ctx=disc_ctx,
-            )
-
-            root_key = _root_cache_key(str(project_root), doc_path, relative_path, contract_name)
-            cache_root = _user_ns(args.cache_ns, root_key) if args.cache_ns is not None else None
-            # Record the namespaces this run used in its metadata so the cache explorer
-            # can be pointed at the run by id alone. root_key — hence cache_root — is
-            # derived from the resolved doc (supplied or discovered), which isn't known
-            # until here; so, unlike the doc-independent discovery_cache_root in the
-            # up-front run tags, it has to be recorded from inside runner.
-            await data_logger("cache_root", {
-                "cache_root": list(cache_root) if cache_root is not None else None,
-                "contract_name": str(contract_name),
-                "memory_ns": memory_ns,
-            })
-            # Per-user cache namespace for the indexed code_explorer's question
-            # cache (mirrors what autoprove_common does for the source_question_ns).
-            source_question_ns = _user_ns("source_agent", "cache", root_key)
+    async def runner(fact: HandlerFactory[FoundryPhase, None]) -> FoundryPipelineResult:
+        async with (
+            cli_pipeline(
+                  args=args,
+                  thread_id=thread_id,
+                  summary=summary,
+                  task_handler=fact,
+                  design_doc_phase=cast(FoundryPhase, FoundryPhase.DISCOVER_DESIGN_DOC),
+                  at_exit=None,
+                  workflow="foundry"
+            ) as (staged, cont),
+            PostgreSQLRAGDatabase.rag_context(staged.embed_model, args.rag_db) as foundry_rag_db,
+        ):
+            source_question_ns = user_ns("source_agent", "cache", staged.root_key)
 
             env = build_foundry_env(
-                model_provider=model_provider,
-                project_root=str(project_root),
+                model_provider=staged.llm_models,
+                project_root=staged.source.project_root,
                 forbidden_read=FS_FORBIDDEN_READ,
                 rag_db=foundry_rag_db,
-                store=conns.indexed_store,
+                store=staged.conns.indexed_store,
                 source_question_ns=source_question_ns,
                 recursion_limit=args.recursion_limit,
             )
-
-            ctx = WorkflowContext.create(
-                services=lambda ns: conns.memory(ns),
-                thread_id=thread_id,
-                store=conns.store,
-                recursion_limit=args.recursion_limit,
-                cache_namespace=cache_root,
-                memory_namespace=memory_ns,
-            )
-
-            source_input = FoundrySourceCode(
-                content=content,
-                project_root=str(project_root),
-                contract_name=contract_name,
-                relative_path=relative_path,
-                forbidden_read=FS_FORBIDDEN_READ,
-            )
-
-            return await run_foundry_pipeline(
-                source_input=source_input,
-                ctx=ctx,
-                handler_factory=handler,
-                env=env,
-                max_concurrent=args.max_concurrent,
-                max_bug_rounds=args.max_bug_rounds,
-                interactive=args.interactive,
+            f_backend = backend(
                 forge_binary=args.forge_binary,
                 forge_timeout_s=args.forge_timeout_s,
+                source_input=staged.source,
                 forge_concurrency=args.max_forge_runners
             )
+            return await cont(env, f_backend)
 
-        yield runner
+    yield runner

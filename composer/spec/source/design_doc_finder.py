@@ -20,7 +20,7 @@ phase / handler.
 import hashlib
 import logging
 import pathlib
-from typing import Any, Literal, NotRequired, Sequence, TypedDict, override
+from typing import Any, Literal, NotRequired, Sequence, TypedDict, override, Callable
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +33,7 @@ from graphcore.tools.schemas import WithAsyncImplementation
 from composer.input.files import Document, FileUploader
 from composer.io.context import emit_custom_event
 from composer.io.multi_job import HandlerFactory, HasName, TaskInfo, run_task
-from composer.spec.context import CacheKey, WorkflowContext
+from composer.spec.context import CacheKey, WorkflowContext, SourceFields
 from composer.spec.gen_types import TypedTemplate
 from composer.spec.graph_builder import bind_standard, run_to_completion
 from composer.spec.service_host import ModelProvider
@@ -233,14 +233,9 @@ def discovery_cache_key(project_root: str, relative_path: str, contract_name: st
 
 async def _discover[P: HasName](
     *,
-    project_root: str,
-    contract_name: str,
-    relative_path: str,
-    forbidden_read: str,
-    uploader: FileUploader,
+    source: SourceFields,
     models: ModelProvider,
-    handler: HandlerFactory[P, None],
-    discover_phase: P,
+    uploader: FileUploader,
     disc_ctx: WorkflowContext[None],
 ) -> DesignDocChoice:
     """Discover a design doc, cached, as a visible ``DISCOVER_DESIGN_DOC`` task.
@@ -252,51 +247,42 @@ async def _discover[P: HasName](
     only on a miss, ``cache_put`` after."""
     child = disc_ctx.child(DESIGN_DOC_DISCOVERY_KEY)
 
-    async def _run() -> DesignDocChoice:
-        cached = await child.cache_get(DesignDocChoice)
-        if cached is not None:
-            _emit_choice("reusing cached", cached)  # cache hit: report, skip the agent
-            return cached
-        source_tools = build_basic_source_tools(project_root, forbidden_read).base_source_tools
-        # Add read_document so the finder can read PDFs (and other binary docs) properly,
-        # not just judge them by filename.
-        tools = [*source_tools, read_document_tool(uploader, project_root)]
-        choice = await find_design_doc(
-            builder=models.builder_lite(),
-            source_tools=tools,
-            contract_name=contract_name,
-            relative_path=relative_path,
-            recursion_limit=child.recursion_limit,
-        )
-        await child.cache_put(choice)
-        _emit_choice("discovered", choice)
-        return choice
+    forbidden_read = source.forbidden_read
+    project_root = source.project_root
+    contract_name = source.contract_name
+    relative_path = source.relative_path
 
-    return await run_task(
-        handler,
-        TaskInfo(DESIGN_DOC_DISCOVERY_TASK_ID, "Design Doc Discovery", discover_phase),
-        _run,
+    cached = await child.cache_get(DesignDocChoice)
+    if cached is not None:
+        _emit_choice("reusing cached", cached)  # cache hit: report, skip the agent
+        return cached
+    source_tools = build_basic_source_tools(project_root, forbidden_read).base_source_tools
+    # Add read_document so the finder can read PDFs (and other binary docs) properly,
+    # not just judge them by filename.
+    tools = [*source_tools, read_document_tool(uploader, project_root)]
+    choice = await find_design_doc(
+        builder=models.builder_lite(),
+        source_tools=tools,
+        contract_name=contract_name,
+        relative_path=relative_path,
+        recursion_limit=child.recursion_limit,
     )
+    await child.cache_put(choice)
+    _emit_choice("discovered", choice)
+    return choice
 
 
 # ---------------------------------------------------------------------------
 # Resolution funnel
 # ---------------------------------------------------------------------------
 
-
 async def resolve_design_doc[P: HasName](
     *,
-    system_doc_arg: str | None,
-    project_root: str,
-    contract_name: str,
-    relative_path: str,
-    forbidden_read: str,
+    source: SourceFields,
     uploader: FileUploader,
     models: ModelProvider,
-    handler: HandlerFactory[P, None],
-    discover_phase: P,
     disc_ctx: WorkflowContext[None],
-) -> tuple[pathlib.Path, Document]:
+) -> pathlib.Path:
     """Resolve the design document to a ``(path, Document)`` pair.
 
     When ``system_doc_arg`` is given, read it directly (unchanged behavior, no phase).
@@ -305,36 +291,19 @@ async def resolve_design_doc[P: HasName](
     path feeds the unchanged byte-hash root cache key, so a discovered doc and a
     supplied doc produce an identical key.
     """
-    if system_doc_arg is not None:
-        path = pathlib.Path(system_doc_arg)
-        content = await uploader.get_document(path)
-        if content is None:
-            raise ValueError(f"cannot read {system_doc_arg}")
-        return path, content
-
+    
     choice = await _discover(
-        project_root=project_root,
-        contract_name=contract_name,
-        relative_path=relative_path,
-        forbidden_read=forbidden_read,
+        source=source,
         uploader=uploader,
         models=models,
-        handler=handler,
-        discover_phase=discover_phase,
         disc_ctx=disc_ctx,
     )
     if choice.selected_path is None:  # None *is* "no doc found"
         raise ValueError(
-            f"No design document found under {project_root}.\n"
+            f"No design document found under {source.project_root}.\n"
             f"  {choice.reason}\n"
             "  Pass one explicitly as the design-doc argument — e.g. a file under test/ "
             "or a .json file, which the finder does not search."
         )
-    path = pathlib.Path(project_root) / choice.selected_path
-    content = await uploader.get_document(path)
-    if content is None:
-        raise ValueError(
-            f"the finder selected {choice.selected_path!r}, but it could not be read "
-            f"(resolved to {path})."
-        )
-    return path, content
+    path = pathlib.Path(source.project_root) / choice.selected_path
+    return path
